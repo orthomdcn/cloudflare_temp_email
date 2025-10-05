@@ -25,32 +25,36 @@ jobs:
 
       - uses: pnpm/action-setup@v3
         name: Install pnpm
-        id: pnpm-install
         with:
           version: 8
           run_install: false
 
-      - name: Deploy Backend for ${{ github.ref_name }}
+      - name: Build and Deploy Backend
+        env:
+          # 将所有 secrets 注入到环境变量中，以便脚本可以访问
+          ${{ toJSON(secrets) }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
-          # --- 检查必需的 Secrets ---
-          MANDATORY_SECRETS=(
-            "DOMAINS"
-            "JWT_SECRET"
-            "ADMIN_PASSWORDS"
-            "DB_DATABASE_NAME"
-            "DB_DATABASE_ID"
-          )
-          for secret in "${MANDATORY_SECRETS[@]}"; do
-            # 使用间接变量引用来获取 secret 的值
-            value=$(eval echo \$"$secret")
-            if [ -z "$value" ]; then
-              echo "❌ Error: Mandatory secret $secret is not set. Please add it to your repository's Actions secrets."
-              exit 1
-            fi
-          done
-          echo "✅ All mandatory secrets are set."
+          # --- 1. 检查必需的 Secrets ---
+          # 这个检查现在更加直接和可靠
+          if [ -z "${{ secrets.DOMAINS }}" ] || \
+             [ -z "${{ secrets.JWT_SECRET }}" ] || \
+             [ -z "${{ secrets.ADMIN_PASSWORDS }}" ] || \
+             [ -z "${{ secrets.DB_DATABASE_NAME }}" ] || \
+             [ -z "${{ secrets.DB_DATABASE_ID }}" ]; then
+            echo "❌ 错误：一个或多个必需的 secret 未设置或为空！"
+            echo "请在仓库的 'Settings' -> 'Secrets and variables' -> 'Actions' 中检查以下必需的 secrets 是否都已正确设置："
+            echo "- DOMAINS"
+            echo "- JWT_SECRET"
+            echo "- ADMIN_PASSWORDS"
+            echo "- DB_DATABASE_NAME"
+            echo "- DB_DATABASE_ID"
+            exit 1
+          fi
+          echo "✅ 所有必需的 secret 都已设置。"
 
-          # --- 动态生成 wrangler.toml ---
+          # --- 2. 动态生成 wrangler.toml ---
           cd worker/
 
           # 写入 wrangler.toml 的静态部分和必需的变量
@@ -60,75 +64,62 @@ jobs:
           compatibility_date = "2025-04-01"
           compatibility_flags = [ "nodejs_compat" ]
 
-          # 必需的 D1 数据库绑定
           [[d1_databases]]
           binding = "DB"
           database_name = "${{ secrets.DB_DATABASE_NAME }}"
           database_id = "${{ secrets.DB_DATABASE_ID }}"
 
           [vars]
-          # 必需的变量
           DOMAINS = '${{ secrets.DOMAINS }}'
           JWT_SECRET = "${{ secrets.JWT_SECRET }}"
           ADMIN_PASSWORDS = '${{ secrets.ADMIN_PASSWORDS }}'
           EOF
-          echo "Generated wrangler.toml with mandatory variables."
 
-          # --- 动态添加可选变量 ---
-          # 将所有 secrets 转换为 JSON 并筛选出可选变量
-          # 注意：请不要在 secret 的名字中使用 `"` 或 `\` 等特殊字符
-          echo '${{ toJSON(secrets) }}' | jq -r 'keys[]' | while read -r secret; do
-            # 排除必需变量和 Github 自动添加的 GITHUB_TOKEN
-            if [[ ! " ${MANDATORY_SECRETS[*]} " =~ " ${secret} " ]] && [[ "$secret" != "GITHUB_TOKEN" ]] && [[ "$secret" != CLOUDFLARE* ]]; then
-              value=$(eval echo \$"$secret")
-              # 只有当 secret 的值不为空时才添加
+          # --- 3. 动态添加可选变量 ---
+          # 此处直接使用 env 上下文，更加稳定
+          MANDATORY_SECRETS_LIST="DOMAINS JWT_SECRET ADMIN_PASSWORDS DB_DATABASE_NAME DB_DATABASE_ID GITHUB_TOKEN CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN"
+          
+          echo '${{ toJSON(secrets) }}' | jq -r 'keys[]' | while read -r secret_key; do
+            if [[ ! " $MANDATORY_SECRETS_LIST " =~ " ${secret_key} " ]]; then
+              # 从环境变量中获取 secret 的值
+              value="${!secret_key}"
               if [ -n "$value" ]; then
-                echo "Found optional secret: $secret, adding to wrangler.toml."
-                # 判断值是否为布尔值或纯数字，如果不是，则用双引号包裹
-                if [[ "$value" == "true" ]] || [[ "$value" == "false" ]] || [[ "$value" =~ ^[0-9]+$ ]]; then
-                  echo "$secret = $value" >> wrangler.toml
-                # 判断值是否为 JSON 数组或对象，如果是，则用单引号包裹
+                echo "找到可选 secret: $secret_key, 正在添加到 wrangler.toml..."
+                if [[ "$value" == "true" ]] || [[ "$value" == "false" ]] || [[ "$value" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+                  echo "$secret_key = $value" >> wrangler.toml
                 elif [[ "$value" == "["* || "$value" == "{"* ]]; then
-                    echo "$secret = '$value'" >> wrangler.toml
+                  echo "$secret_key = '$value'" >> wrangler.toml
                 else
-                  echo "$secret = \"$value\"" >> wrangler.toml
+                  escaped_value=$(echo "$value" | sed 's/"/\\"/g')
+                  echo "$secret_key = \"$escaped_value\"" >> wrangler.toml
                 fi
               fi
             fi
           done
-          
-          echo "--- Generated wrangler.toml content ---"
-          cat wrangler.toml
-          echo "---------------------------------------"
 
-          # --- 后续的安装和部署步骤 ---
-          # (这部分与您之前的脚本保持一致)
-          export use_worker_assets=${{ secrets.USE_WORKER_ASSETS }}
-          if [ -n "$use_worker_assets" ]; then
+          echo "--- 生成的 wrangler.toml 内容如下 ---"
+          cat wrangler.toml
+          echo "------------------------------------"
+
+          # --- 4. 安装依赖并部署 ---
+          if [ -n "${USE_WORKER_ASSETS}" ]; then
             cd ../frontend/
             pnpm install --no-frozen-lockfile
-            if [ -n "${{ secrets.USE_WORKER_ASSETS_WITH_TELEGRAM }}" ]; then
+            if [ -n "${USE_WORKER_ASSETS_WITH_TELEGRAM}" ]; then
               pnpm build:telegram:pages
             else
               pnpm build:pages
             fi
             cd ../worker/
           fi
-          
-          export use_mail_wasm_parser=${{ secrets.BACKEND_USE_MAIL_WASM_PARSER }}
+
           pnpm install --no-frozen-lockfile
-          if [ -n "$use_mail_wasm_parser" ]; then
+          
+          if [ -n "${BACKEND_USE_MAIL_WASM_PARSER}" ]; then
             pnpm add mail-parser-wasm-worker
             git apply ../.github/config/mail-parser-wasm-worker.patch
           fi
 
-          if [ "${{ secrets.DEBUG_MODE }}" = "true" ]; then
-            pnpm run deploy
-          else
-            pnpm run deploy
-          fi
-          echo "🚀 Deployment successful for tag ${{ github.ref_name }}"
-        env:
-          # 将所有 secrets 作为环境变量传递给脚本
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          pnpm run deploy
+          echo "🚀 部署成功！"
+
