@@ -105,9 +105,10 @@ jobs:
           cd worker/
           cp wrangler.toml.template wrangler.toml
           
-          # --- 关键修复：移除模板中的占位配置，防止重复 ---
+          # --- 关键修复：移除模板中的所有占位配置，防止重复 ---
           sed -i '/^\[\[d1_databases\]\]/,/database_id =/d' wrangler.toml
           sed -i '/^\[\[kv_namespaces\]\]/,/id =/d' wrangler.toml
+          sed -i '/^\[vars\]/d' wrangler.toml
 
           # 检查必选 secrets
           if [ -z "$CLOUDFLARE_ACCOUNT_ID" ] || [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$DATABASE_ID" ] || [ -z "$DATABASE_NAME" ] || [ -z "$DOMAINS" ] || [ -z "$JWT_SECRET" ]; then
