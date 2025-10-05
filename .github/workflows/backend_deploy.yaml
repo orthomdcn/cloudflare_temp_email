@@ -25,101 +25,110 @@ jobs:
 
       - uses: pnpm/action-setup@v3
         name: Install pnpm
+        id: pnpm-install
         with:
           version: 8
           run_install: false
 
-      - name: Build and Deploy Backend
-        env:
-          # 将所有 secrets 注入到环境变量中，以便脚本可以访问
-          ${{ toJSON(secrets) }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      - name: Deploy Backend for ${{ github.ref_name }}
         run: |
-          # --- 1. 检查必需的 Secrets ---
-          # 这个检查现在更加直接和可靠
-          if [ -z "${{ secrets.DOMAINS }}" ] || \
-             [ -z "${{ secrets.JWT_SECRET }}" ] || \
-             [ -z "${{ secrets.ADMIN_PASSWORDS }}" ] || \
-             [ -z "${{ secrets.DB_DATABASE_NAME }}" ] || \
-             [ -z "${{ secrets.DB_DATABASE_ID }}" ]; then
-            echo "❌ 错误：一个或多个必需的 secret 未设置或为空！"
-            echo "请在仓库的 'Settings' -> 'Secrets and variables' -> 'Actions' 中检查以下必需的 secrets 是否都已正确设置："
-            echo "- DOMAINS"
-            echo "- JWT_SECRET"
-            echo "- ADMIN_PASSWORDS"
-            echo "- DB_DATABASE_NAME"
-            echo "- DB_DATABASE_ID"
-            exit 1
+          export use_worker_assets=${{ secrets.USE_WORKER_ASSETS }}
+          export use_worker_assets_with_telegram=${{ secrets.USE_WORKER_ASSETS_WITH_TELEGRAM }}
+          if [ -n "$use_worker_assets" ]; then
+            cd frontend/
+            pnpm install --no-frozen-lockfile
+            if [ -n "$use_worker_assets_with_telegram" ]; then
+              echo "Building with telegram pages"
+              pnpm build:telegram:pages
+            else
+              echo "Building with normal pages"
+              pnpm build:pages
+            fi
+            cd ..
           fi
-          echo "✅ 所有必需的 secret 都已设置。"
 
-          # --- 2. 动态生成 wrangler.toml ---
+          export debug_mode=${{ secrets.DEBUG_MODE }}
+          export use_mail_wasm_parser=${{ secrets.BACKEND_USE_MAIL_WASM_PARSER }}
           cd worker/
 
-          # 写入 wrangler.toml 的静态部分和必需的变量
-          cat << EOF > wrangler.toml
-          name = "cloudflare_temp_email"
-          main = "src/worker.ts"
-          compatibility_date = "2025-04-01"
-          compatibility_flags = [ "nodejs_compat" ]
+          # 从模板创建 wrangler.toml
+          cp wrangler.toml.template wrangler.toml
 
-          [[d1_databases]]
-          binding = "DB"
-          database_name = "${{ secrets.DB_DATABASE_NAME }}"
-          database_id = "${{ secrets.DB_DATABASE_ID }}"
+          # 检查必选的 secrets
+          if [ -z "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" ] || \
+             [ -z "${{ secrets.CLOUDFLARE_API_TOKEN }}" ] || \
+             [ -z "${{ secrets.DATABASE_ID }}" ] || \
+             [ -z "${{ secrets.DATABASE_NAME }}" ] || \
+             [ -z "${{ secrets.ARRAY_DOMAINS }}" ] || \
+             [ -z "${{ secrets.VAR_JWT_SECRET }}" ]; then
+            echo "错误：一个或多个必选的 secrets 未设置。"
+            echo "请确保 CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN, DATABASE_ID, DATABASE_NAME, ARRAY_DOMAINS, 和 VAR_JWT_SECRET 都已配置。"
+            exit 1
+          fi
 
-          [vars]
-          DOMAINS = '${{ secrets.DOMAINS }}'
-          JWT_SECRET = "${{ secrets.JWT_SECRET }}"
-          ADMIN_PASSWORDS = '${{ secrets.ADMIN_PASSWORDS }}'
-          EOF
+          # 开始向 wrangler.toml 添加 D1 数据库绑定
+          echo "" >> wrangler.toml
+          echo "[[d1_databases]]" >> wrangler.toml
+          echo "binding = \"DB\"" >> wrangler.toml
+          echo "database_name = \"${{ secrets.DATABASE_NAME }}\"" >> wrangler.toml
+          echo "database_id = \"${{ secrets.DATABASE_ID }}\"" >> wrangler.toml
 
-          # --- 3. 动态添加可选变量 ---
-          # 此处直接使用 env 上下文，更加稳定
-          MANDATORY_SECRETS_LIST="DOMAINS JWT_SECRET ADMIN_PASSWORDS DB_DATABASE_NAME DB_DATABASE_ID GITHUB_TOKEN CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_TOKEN"
-          
-          echo '${{ toJSON(secrets) }}' | jq -r 'keys[]' | while read -r secret_key; do
-            if [[ ! " $MANDATORY_SECRETS_LIST " =~ " ${secret_key} " ]]; then
-              # 从环境变量中获取 secret 的值
-              value="${!secret_key}"
-              if [ -n "$value" ]; then
-                echo "找到可选 secret: $secret_key, 正在添加到 wrangler.toml..."
-                if [[ "$value" == "true" ]] || [[ "$value" == "false" ]] || [[ "$value" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
-                  echo "$secret_key = $value" >> wrangler.toml
-                elif [[ "$value" == "["* || "$value" == "{"* ]]; then
-                  echo "$secret_key = '$value'" >> wrangler.toml
-                else
-                  escaped_value=$(echo "$value" | sed 's/"/\\"/g')
-                  echo "$secret_key = \"$escaped_value\"" >> wrangler.toml
-                fi
+          # 开始向 [vars] 部分添加变量
+          echo "" >> wrangler.toml
+          echo "[vars]" >> wrangler.toml
+
+          # 动态处理所有带前缀的 secrets
+          for secret_name in $(env | grep -E '^(VAR_|ARRAY_|LITERAL_)' | cut -d= -f1); do
+            var_value=$(eval echo "\$$secret_name")
+            if [ -z "$var_value" ]; then
+              continue
+            fi
+
+            if [[ $secret_name == VAR_* ]]; then
+              var_name=$(echo "$secret_name" | sed 's/^VAR_//')
+              if [[ "$var_value" == "true" ]] || [[ "$var_value" == "false" ]] || [[ "$var_value" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+                echo "$var_name = $var_value" >> wrangler.toml
+              else
+                echo "$var_name = \"$var_value\"" >> wrangler.toml
               fi
+            elif [[ $secret_name == ARRAY_* ]]; then
+              var_name=$(echo "$secret_name" | sed 's/^ARRAY_//')
+              formatted_value=$(echo "$var_value" | awk -F, '{
+                printf "["
+                for (i=1; i<=NF; i++) {
+                  gsub(/^[ \t]+|[ \t]+$/, "", $i);
+                  printf "\"" $i "\""
+                  if (i<NF) printf ", "
+                }
+                printf "]"
+              }')
+              echo "$var_name = $formatted_value" >> wrangler.toml
+            elif [[ $secret_name == LITERAL_* ]]; then
+              var_name=$(echo "$secret_name" | sed 's/^LITERAL_//')
+              echo "$var_name = $var_value" >> wrangler.toml
             fi
           done
 
-          echo "--- 生成的 wrangler.toml 内容如下 ---"
-          cat wrangler.toml
-          echo "------------------------------------"
-
-          # --- 4. 安装依赖并部署 ---
-          if [ -n "${USE_WORKER_ASSETS}" ]; then
-            cd ../frontend/
-            pnpm install --no-frozen-lockfile
-            if [ -n "${USE_WORKER_ASSETS_WITH_TELEGRAM}" ]; then
-              pnpm build:telegram:pages
-            else
-              pnpm build:pages
-            fi
-            cd ../worker/
-          fi
-
           pnpm install --no-frozen-lockfile
-          
-          if [ -n "${BACKEND_USE_MAIL_WASM_PARSER}" ]; then
+
+          if [ -n "$use_mail_wasm_parser" ]; then
+            echo "Using mail-parser-wasm-worker"
             pnpm add mail-parser-wasm-worker
             git apply ../.github/config/mail-parser-wasm-worker.patch
+            echo "Applied mail-parser-wasm-worker patch"
           fi
 
-          pnpm run deploy
-          echo "🚀 部署成功！"
-
+          if [ "$debug_mode" = "true" ]; then
+            pnpm run deploy
+          else
+            output=$(pnpm run deploy 2>&1)
+            if [ $? -ne 0 ]; then
+                code=$?
+                echo "Command failed with exit code $code"
+                exit $code
+            fi
+          fi
+          echo "Deployed for tag ${{ github.ref_name }}"
+        env:
+          # 将所有 secrets 注入环境变量以供脚本读取
+          ${{ toJSON(secrets) }}
